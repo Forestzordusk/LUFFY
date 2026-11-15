@@ -1,0 +1,140 @@
+name: Sync Complete TODO README
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out dev
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+
+      - name: Update the Complete TODO List
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import re
+          import subprocess
+          from pathlib import Path
+
+          MAIN_SHA = "266cbc22215201a93c02e37200fe32be98a9e931"
+          TITLE = "### 📝 Complete TODO List"
+          README = Path("README.md")
+
+          def git(*args):
+              return subprocess.check_output(["git", *args], text=True).strip()
+
+          def extract_todos(ref):
+              paths = git("ls-tree", "-r", "--name-only", ref).splitlines()
+              todos = []
+              for path in paths:
+                  if not path.endswith(".py"):
+                      continue
+                  raw = subprocess.check_output(["git", "show", f"{ref}:{path}"])
+                  source = raw.decode("utf-8")
+                  for line_number, line in enumerate(source.splitlines(), 1):
+                      match = re.search(r"#\s*TODO\b(.*)", line)
+                      if match is None:
+                          continue
+                      text = match.group(1).strip()
+                      if text.startswith(":"):
+                          text = text[1:].strip()
+                      todos.append((path, line_number, text))
+              return sorted(todos, key=lambda item: (item[0], item[1]))
+
+          main_todos = extract_todos(MAIN_SHA)
+          dev_todos = extract_todos("HEAD")
+
+          readme_text = README.read_text(encoding="utf-8")
+          pattern = re.compile(
+              r"(### 📝 Complete TODO List\n\n)(.*?)(\n\n## 🤝 Contributing)",
+              re.DOTALL,
+          )
+          match = pattern.search(readme_text)
+          if match is None:
+              raise RuntimeError("Could not locate the Complete TODO List section")
+
+          baseline_todos = []
+          for line in match.group(2).splitlines():
+              if not line.strip():
+                  continue
+              item = re.match(r"^- \[ \] \*\*(.+):([0-9]+)\*\* - (.*)$", line)
+              if item is None:
+                  raise RuntimeError(f"Unexpected TODO list line: {line!r}")
+              baseline_todos.append((item.group(1), int(item.group(2)), item.group(3)))
+
+          if baseline_todos != main_todos:
+              print(f"README baseline entries: {len(baseline_todos)}")
+              print(f"Extracted main TODO entries: {len(main_todos)}")
+              for index, (left, right) in enumerate(zip(baseline_todos, main_todos)):
+                  if left != right:
+                      print(f"First difference at {index}: README={left!r}, main={right!r}")
+                      break
+              raise RuntimeError("README TODO baseline does not match main; refusing a global rewrite")
+
+          main_by_path = {}
+          dev_by_path = {}
+          for item in main_todos:
+              main_by_path.setdefault(item[0], []).append(item)
+          for item in dev_todos:
+              dev_by_path.setdefault(item[0], []).append(item)
+          changed_paths = sorted(
+              path
+              for path in set(main_by_path) | set(dev_by_path)
+              if main_by_path.get(path, []) != dev_by_path.get(path, [])
+          )
+          print("Python files with TODO changes:", changed_paths)
+
+          if dev_todos != sorted(dev_todos, key=lambda item: (item[0], item[1])):
+              raise RuntimeError("Development TODO entries are not sorted")
+
+          new_block = "\n".join(
+              f"- [ ] **{path}:{line_number}** - {text}"
+              for path, line_number, text in dev_todos
+          )
+          updated_text = pattern.sub(
+              lambda found: found.group(1) + new_block + found.group(3),
+              readme_text,
+              count=1,
+          )
+          if updated_text.count(TITLE) != 1:
+              raise RuntimeError("TODO section title changed or duplicated")
+
+          check_match = pattern.search(updated_text)
+          check_todos = []
+          for line in check_match.group(2).splitlines():
+              item = re.match(r"^- \[ \] \*\*(.+):([0-9]+)\*\* - (.*)$", line)
+              if item is not None:
+                  check_todos.append((item.group(1), int(item.group(2)), item.group(3)))
+          if check_todos != dev_todos:
+              raise RuntimeError("The rewritten README did not validate")
+
+          with README.open("w", encoding="utf-8", newline="\n") as handle:
+              handle.write(updated_text)
+          print(f"Updated TODO list: {len(baseline_todos)} -> {len(dev_todos)} entries")
+          PY
+
+      - name: Remove this temporary workflow and commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f .github/workflows/todo-readme-sync.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md .github/workflows/todo-readme-sync.yml
+          if git diff --cached --quiet; then
+            echo "No repository changes to commit"
+          else
+            git commit -m "docs: update complete TODO list"
+            git push origin HEAD:dev
+          fi
